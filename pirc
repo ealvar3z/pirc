@@ -1,0 +1,61 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use IO::Socket::INET;
+use POSIX qw(strftime);
+use Term::ReadLine;
+use Term::ANSIColor;
+
+Getopt::Long::Configure('no_ignore_case');
+
+my $VERSION = do {
+	chomp(my $v = `git describe --tags --always 2>/dev/null`);
+	$v || '0.1.0';
+};
+
+my $HELP = 0;
+my $SHOWVER = 0;
+
+my $server_host; 		# -s
+my $server_port = 6697;		# -P
+my $channel;	 		# -c
+my $nick;			# -u
+my $server_password; 		# -p
+my $server_username; 		# -U
+my $exec_cmd; 			# -x (ie. -x <cmd>)
+
+my $PIRC_STATUS = $ENV{PIRC_STATUS} // "\e[7m";
+my $PIRC_INPUTRC = $ENV{PIRC_INPUTRC} // "\e[7m";
+
+my $tmp_dir = '.pirc_tmp';
+my $current_chan = '';
+
+my $NICK_COLUMN_WIDTH = 10;
+my $LINE_WRAP_WIDTH   = 60;
+
+GetOptions(
+	"h" => \$HELP,
+	"v" => \$SHOWVER,
+	"s=s" => \$server_host,
+	"P=i" => \$server_port,
+	"c=s" => \$channel,
+	"u=s" => \$server_username,
+	"x=s" => \$exec_cmd,
+) or die "Error in command line args\n";
+
+if ($HELP) {
+	print_usage();
+	exit 0;
+}
+
+if ($SHOWVER) {
+	print "pirc version $VERSION\n";
+	exit 0;
+}
+
+die "Error: Must specify -s <host>\n" unless $server_host;
+die "Error: Must specify -c <channel>\n" unless $channel;
+die "Error: Must specify -u <nick>\n" unless $nick;
+

@@ -1,0 +1,77 @@
+# Usage / CLI Args
+
+```shell
+pirch <args>
+
+-s <host>
+-c <channel>
+-u <nick>
+-p <password>
+-U <username (default: $USER)>
+-p <port>
+-x <cmd>
+
+-h (help)
+-v (version)
+```
+
+## Command (in-client)
+
+```shell
+/join <channel>
+/part <channel>
+/quit
+/msg <nick> <message>
+/me <message>
+/next
+/prev
+/<num>
+/nick <nick>
+/names
+/topic
+/away <message>
+/raw <args>
+```
+
+## Dependencies
+
+- `Perl`
+- POSIX compatible system
+
+## Keybindings
+
+```
+Ctrl+n - Next buffer
+Ctrl+p - Previous buffer
+Tab    - Completion of nicks and channels
+
+Furthermore, all readline keybindings are available for use. See the
+readline manpages for the actual list.
+
+Keybindings can also be set via a .inputrc file. Which
+can be configured by setting `$PIRC_INPUTRC`.
+
+(PIRC_INPUTRC=/path/to/pirc-inputrc pirc)
+```
+
+## Customization
+
+```
+(These are environment variables)
+
+# Set the formatting of the tab line's selected item.
+# This defaults to reverse video.
+PIRC_STATUS='\e[7m'
+
+# The path to a readline based .inputrc file to change
+# birch's input settings. 
+#
+# See http://man7.org/linux/man-pages/man3/readline.3.html
+PIRC_INPUTRC=/path/to/file
+```
+
+## Credit
+
+`dylanaraps` -> https://github.com/dylanaraps/birch
+
+This is an almost one-to-one port from Bash to Perl.
