@@ -1,5 +1,6 @@
 #!/usr/bin/env perl
 
+use feature 'state';
 use strict;
 use warnings;
 use Getopt::Long;
@@ -10,271 +11,484 @@ use Term::ANSIColor;
 
 Getopt::Long::Configure('no_ignore_case');
 
+# ------------------------------------------------------------------------------
+# Version from Git
+# ------------------------------------------------------------------------------
 my $VERSION = do {
-	chomp(my $v = `git describe --tags --always 2>/dev/null`);
-	$v || '0.1.0';
+    chomp(my $v = `git describe --tags --always 2>/dev/null`);
+    $v || '0.1.0';
 };
 
-my $HELP = 0;
-my $SHOWVER = 0;
+# ------------------------------------------------------------------------------
+# Globals and CLI Options
+# ------------------------------------------------------------------------------
+my ($HELP, $SHOWVER) = (0, 0);
+my ($server_host, $server_port, $channel, $nick, $server_password, $server_username, $exec_cmd);
+# Default to 6697 (commonly SSL, but we’re using plain INET here)
+$server_port = 6697;
 
-my $server_host; 			# -s
-my $server_port = 6697;		# -P
-my $channel;	 			# -c
-my $nick;					# -u
-my $server_password; 		# -p
-my $server_username; 		# -U
-my $exec_cmd; 				# -x (ie. -x <cmd>)
+my $PIRC_STATUS  = $ENV{PIRC_STATUS}  // "\e[7m";
+my $PIRC_INPUTRC = $ENV{PIRC_INPUTRC} // "";
 
-my $PIRC_STATUS = $ENV{PIRC_STATUS} // "\e[7m";
-my $PIRC_INPUTRC = $ENV{PIRC_INPUTRC} // "\e[7m";
+my $tmp_dir            = '.pirc_tmp';
+my $current_chan       = '';
+my $current_channel_idx = 0;     # track which channel index we’re on
+my @joined_channels    = ();     # track all joined channels
 
-my $tmp_dir = '.pirc_tmp';
-my $current_chan = '';
-
+# Formatting constants
 my $NICK_COLUMN_WIDTH = 10;
 my $LINE_WRAP_WIDTH   = 60;
 
+# ------------------------------------------------------------------------------
+# Parse CLI
+# ------------------------------------------------------------------------------
 GetOptions(
-	"h" => \$HELP,
-	"v" => \$SHOWVER,
-	"s=s" => \$server_host,
-	"P=i" => \$server_port,
-	"c=s" => \$channel,
-	"u=s" => \$server_username,
-	"x=s" => \$exec_cmd,
+    "h"   => \$HELP,
+    "v"   => \$SHOWVER,
+    "s=s" => \$server_host,
+    "P=i" => \$server_port,
+    "c=s" => \$channel,
+    "u=s" => \$nick,
+    "p=s" => \$server_password,
+    "U=s" => \$server_username,
+    "x=s" => \$exec_cmd,
 ) or die "Error in command line args\n";
 
 if ($HELP) {
-	print_usage();
-	exit 0;
+    print_usage();
+    exit 0;
 }
-
 if ($SHOWVER) {
-	print "pirc version $VERSION\n";
-	exit 0;
+    print "pirc version $VERSION\n";
+    exit 0;
 }
 
-die "Error: Must specify -s <host>\n" unless $server_host;
+die "Error: Must specify -s <host>\n"    unless $server_host;
 die "Error: Must specify -c <channel>\n" unless $channel;
-die "Error: Must specify -u <nick>\n" unless $nick;
+die "Error: Must specify -u <nick>\n"    unless $nick;
 
+# ------------------------------------------------------------------------------
+# Init
+# ------------------------------------------------------------------------------
 init_temp_dir();
 $current_chan = $channel;
 write_current_channel($current_chan);
 create_completion_file($channel);
 
-# let's connect to IRC
-my $socket = IO::Socket::INET->new(
-	PeerHost => $server_host,
-	PeerPort => $server_port,
-	Proto	 => 'tcp',
-) or die "Could not connect to $server_host:$server_port : $!\n";
+# Keep track of joined channels for /next, /prev
+@joined_channels    = ($channel);
+$current_channel_idx = 0;
 
+# ------------------------------------------------------------------------------
+# Connect to IRC
+# ------------------------------------------------------------------------------
+my $socket = IO::Socket::INET->new(
+    PeerHost => $server_host,
+    PeerPort => $server_port,
+    Proto    => 'tcp',
+) or die "Could not connect to $server_host:$server_port : $!\n";
 $socket->autoflush(1);
 
 if ($server_password) {
-	send_raw("PASS $server_password");
+    send_raw("PASS $server_password");
 }
 
 my $irc_user = $server_username // $nick;
+# Typically: USER <username> <mode=0> * :<realname>
 send_raw("NICK $nick");
-send_raw("USER $irc_user");
+send_raw("USER $irc_user 0 * :$nick");
 
-# let's attempt to join
+# Attempt to join
 send_raw("JOIN $channel");
 
-# fork: one process listens for server messages, the other handles user input
+# ------------------------------------------------------------------------------
+# Fork: one process listens (server), other reads user input
+# ------------------------------------------------------------------------------
 my $pid = fork();
- 
-die "Cannot fork: $!\n" unless defines $pid;
+die "Cannot fork: $!\n" unless defined $pid;
 
 if ($pid == 0) {
-	# child process: ie. we read from server
-	run_listener_loop();
-	exit 0;
+    # Child: read from server
+    run_listener_loop();
+    exit 0;
 } else {
-	# parent process: we reader user input
-	run_input_loop();
+    # Parent: read user input
+    run_input_loop();
 
-	# if we do exit, kill the child
-	kill 'TERM', $pid;
-	waitpid($pid, 0);
-	exit 0;
+    # If we exit the input loop, kill the child
+    kill 'TERM', $pid;
+    waitpid($pid, 0);
+    exit 0;
 }
 
+# ------------------------------------------------------------------------------
+# Subroutines
+# ------------------------------------------------------------------------------
+
 sub print_usage {
-	print << "END_USAGE";
+    print << "END_USAGE";
 Usage: pirc [options]
-  -s <host>		Server host
-  -c <channel>		Channel (e.g. #perl)
-  -u <nick>		Nickname
-  -p <password>		Server password
-  -U <username>		Server username (default: $nick)
-  -P <port>		Server port (default: 6697)
-  -x <cmd>		Run extra command after connecting
-  -h			Show this help
-  -v			Show version
+  -s <host>          Server host
+  -c <channel>       Channel (e.g. #perl)
+  -u <nick>          Nickname
+  -p <password>      Server password
+  -U <username>      Server username (default: <nick>)
+  -P <port>          Server port (default: 6697)
+  -x <cmd>           Run extra command after connecting
+  -h                 Show this help
+  -v                 Show version
 END_USAGE
 }
 
+# --- Directory/Files for Tab Completion ---------------------------------------
 sub init_temp_dir {
-	mkdir $tmp_dir unless -d $tmp_dir;
+    mkdir $tmp_dir unless -d $tmp_dir;
 }
 
 sub create_completion_file {
-	my ($name) = @_;
-	return unless $name;
-	open my $fh, '>', "$tmp_dir/$name" or return;
-	close $fh;
+    my ($name) = @_;
+    return unless $name;
+    open my $fh, '>', "$tmp_dir/$name" or return;
+    close $fh;
 }
 
 sub write_current_channel {
-	my ($chan) = @_;
-	open my $fh, '>', "$tmp_dir/.c" or return;
-	print $fh $chan;
-	close $fh;
+    my ($chan) = @_;
+    open my $fh, '>', "$tmp_dir/.c" or return;
+    print $fh $chan;
+    close $fh;
 }
 
 sub read_current_channel {
-	open my $fh, '<', "$tmp_dir/.c" or return '#unknown';
-	my $c = <$fh>;
-	chomp $c if defined $c;
-	return $c || '#unknown';
+    open my $fh, '<', "$tmp_dir/.c" or return '#unknown';
+    my $c = <$fh>;
+    chomp $c if defined $c;
+    return $c || '#unknown';
 }
 
+# --- IRC Socket I/O ----------------------------------------------------------
 sub send_raw {
-	my ($line) = @_;
-	print $socket "$line\r\n";
+    my ($line) = @_;
+    print $socket "$line\r\n";
 }
 
+# --- Listener Loop (Child) ---------------------------------------------------
 sub run_listener_loop {
-	while (my $server_line = <$socket>) {
-		chomp $server_line;
+    while (1) {
+        my $server_line = <$socket>;
 
-		# let's start w/ a naive ping-pong
-		# to keep the server conn alive
-		if ($server_line =~ /^PING\s+(.*)/i) {
-			send_raw("PONG $1");
-			next;
-		}
+        # If EOF or socket closed
+        unless (defined $server_line) {
+            warn "Server closed connection or EOF.\n";
+            last;
+        }
 
-		handle_incoming_irc($server_line);
-	}
+        chomp $server_line;
+        # Ping-pong
+        if ($server_line =~ /^PING\s+(.*)/i) {
+            send_raw("PONG $1");
+            next;
+        }
+        # Parse the rest
+        handle_incoming_irc($server_line);
+    }
 }
 
+# This sub handles lines received from IRC server
+sub handle_incoming_irc {
+    my ($line) = @_;
+
+    # Example: :nick!user@host PRIVMSG #chan :message
+    if ($line =~ /^:(\S+?)!\S+\s+PRIVMSG\s+(\S+)\s+:(.*)/) {
+        my ($msg_nick, $msg_chan, $msg_text) = ($1, $2, $3);
+
+        # If $msg_chan == our nick, it's a private message to us
+        display_irc_message($msg_nick, $msg_chan, $msg_text);
+        create_completion_file($msg_nick);  # so we can tab-complete the nick
+    }
+    # RPL_NAMREPLY => cheap nickname completion
+    elsif ($line =~ /^\S+\s+353\s+(\S+)\s+=\s+(\S+)\s+:(.*)/) {
+        my $found_channel = $2;
+        my @nicks = split(/\s+/, $3);
+        foreach my $n (@nicks) {
+            $n =~ s/^[@+]+//; # strip prefix
+            create_completion_file($n);
+        }
+        print_to_tty("$found_channel nicks: @nicks\n");
+    }
+    else {
+        # Display everything else
+        print_to_tty("<< $line\n");
+    }
+}
+
+# --- Input Loop (Parent) -----------------------------------------------------
 sub run_input_loop {
-	my $term = Term::ReadLine->new('pirc');
-	
-	if ($term->can("completion_function")) {
-		$term->completion_function(\&pirc_complete);
-	}
-	while (1) {
-		my $prompt = prompt_string();
-		my $input  = $term->readline($prompt);
-		last unless defined $input;
-		$input =~ s/^\s+|\s+$//g;
-		next if $input eq '';
+    my $term = Term::ReadLine->new('pirc');
 
-		$term->addhistory($input);
+    if ($term->can("completion_function")) {
+        $term->completion_function(\&pirc_complete);
+    }
 
-		if ($input =~ m{^/}) {
-			handle_client_command($input);
-		} else {
-			my $chan = read_current_channel();
-			send_raw("PRIVMSG $chan :$input");
-			display_local_message($nick, $chan, $input);
-		}
-	}
+    while (1) {
+        my $prompt = prompt_string();
+        my $input  = $term->readline($prompt);
+
+        # If user pressed Ctrl+D or input is closed
+        unless (defined $input) {
+            print_to_tty("Exiting pirc on EOF.\n");
+            last;
+        }
+
+        # Trim
+        $input =~ s/^\s+|\s+$//g;
+        next if $input eq '';
+
+        $term->addhistory($input);
+
+        handle_user_input($input);
+    }
 }
 
-sub prompt_string {
-	my $chan = read_current_channel();
-	return "$chan> ";
-}
-
-sub pirc_complete {
-	my ($text, $line, $start) = @_;
-	opendir my $dh, $tmp_dir or return ();
-	my @candidates;
-	while (my $f = readdir($dh)) {
-		next if $f eq '.' or $f eq '..' or $f eq '.c';
-		push @candidates, $f if index($f, $text) == 0;
-	}
-	closedir $dh;
-	return @candidates;
-}
-
-# dispatch table for commands
-# that way i can avoid all those if-else
-# since perl doesn't support switch-case
-# statements
-
+# --- Command Dispatch Table --------------------------------------------------
 my %COMMANDS = (
-	'join' => sub {
-		my (@args) = @_;
-		my $chan_to_join = $args[0] // '';
-		return unless $chan_to_join;
-		write_current_channel($chan_to_join);
-		create_completion_file($chan_to_join);
-	},
+    'join' => sub {
+        my (@args) = @_;
+        my $chan_to_join = $args[0] // '';
+        return unless $chan_to_join;
 
-	'part' => sub {
-		my (@rgs) = @_;
-		my $chan_to_part = $args[0] // read_current_channel();
-		send_raw("PART $chan_to_part");
-	},
-	
-	'quit' => sub {
-		my (@args) = @_;
-		send_raw("QUIT :pirc user out");
-		exit 0;
-	},
+        # Actually JOIN the channel
+        send_raw("JOIN $chan_to_join");
 
-	'msg' => sub }
-		my ($args) = @_;
-		my $target = shift @args;
-		return unless $target;
-		my $message = join ' ', @args;
-		# do we send here??? ... i think we do per the RFC
-		# we need to send a colon char
-		send_raw("PRIVMSG $target :$message");
-		display_local_message($nick, $target, $message);
-	},
+        # If not already in our list, add it
+        if (!grep { $_ eq $chan_to_join } @joined_channels) {
+            push @joined_channels, $chan_to_join;
+            $current_channel_idx = $#joined_channels; # move to the joined one
+        }
+        write_current_channel($chan_to_join);
+        create_completion_file($chan_to_join);
+    },
 
-	'nick' => sub {
-		my (@args) = @_;
-		my $new_nick = $args[0] // '';
-		return unless $new_nick;
-		# what do we send here???
-		# just the raw string
-		send_raw("NICK $new_nick");
-		$nick = $new_nick; # - this must be global 
-	},
+    'part' => sub {
+        my (@args) = @_;
+        my $chan_to_part = $args[0] // read_current_channel();
+        send_raw("PART $chan_to_part");
 
-	'names' => sub {
-		my (@args) = @_;
-		my $chan = read_current_channel();
-		send_raw("NAMES $chan");
-	},
+        # remove from the list
+        @joined_channels = grep { $_ ne $chan_to_part } @joined_channels;
+        if (!@joined_channels) {
+            # parted last channel, you might define a fallback
+            $current_channel_idx = 0;
+            write_current_channel("#nochan");
+        } else {
+            # if the current idx is out of range, adjust
+            $current_channel_idx = 0 if $current_channel_idx >= @joined_channels;
+            write_current_channel($joined_channels[$current_channel_idx]);
+        }
+    },
 
-	'topic' => sub {
-		my (@args) = @_;
-		my $chan = read_current_channel();
-		send_raw("TOPIC $chan");
-	},
+    'quit' => sub {
+        my (@args) = @_;
+        send_raw("QUIT :pirc user out");
+        exit 0;
+    },
 
-	'away' => sub {
-		my (@args) = @_;
-		my $away_msg = join ' ', @args;
-		send_raw("AWAY :$away_msg");
-	},
+    'msg' => sub {
+        my (@args) = @_;
+        return unless @args >= 2; # need at least target + message
+        my $target  = shift @args;
+        my $message = join ' ', @args;
 
-	'raw' => sub {
-		my (@args) = @_;
-		my $raw_line = join ' ', @args;
-		send_raw($raw_line);
-	},
+        send_raw("PRIVMSG $target :$message");
+        display_local_message($nick, $target, $message);
+    },
 
- 
+    'nick' => sub {
+        my (@args) = @_;
+        my $new_nick = $args[0] // '';
+        return unless $new_nick;
 
+        send_raw("NICK $new_nick");
+        $nick = $new_nick;
+    },
+
+    'names' => sub {
+        my (@args) = @_;
+        my $chan = read_current_channel();
+        send_raw("NAMES $chan");
+    },
+
+    'topic' => sub {
+        my (@args) = @_;
+        my $chan = read_current_channel();
+        send_raw("TOPIC $chan");
+    },
+
+    'away' => sub {
+        my (@args) = @_;
+        my $away_msg = join ' ', @args;
+        send_raw("AWAY :$away_msg");
+    },
+
+    'raw' => sub {
+        my (@args) = @_;
+        my $raw_line = join ' ', @args;
+        send_raw($raw_line);
+    },
+
+    # /next: move to next channel in @joined_channels
+    'next' => sub {
+        return if !@joined_channels;
+        $current_channel_idx = ($current_channel_idx + 1) % @joined_channels;
+        my $chan = $joined_channels[$current_channel_idx];
+        write_current_channel($chan);
+        print_to_tty("Switched to $chan\n");
+    },
+
+    # /prev: move to previous channel in @joined_channels
+    'prev' => sub {
+        return if !@joined_channels;
+        $current_channel_idx--;
+        if ($current_channel_idx < 0) {
+            $current_channel_idx = @joined_channels - 1;
+        }
+        my $chan = $joined_channels[$current_channel_idx];
+        write_current_channel($chan);
+        print_to_tty("Switched to $chan\n");
+    },
+);
+
+# This sub decides if the user typed a slash command or a normal message
+sub handle_user_input {
+    my ($input) = @_;
+
+    # If it starts with '/', treat as a command
+    if ($input =~ m{^/(\S+)(.*)}) {
+        my $command = lc($1);
+        my $rest    = $2 // '';
+        $rest =~ s/^\s+|\s+$//g;  # trim arguments
+
+        my @args = split /\s+/, $rest;
+
+        # See if it's a numeric command => buffer switch, etc.
+        if ($command =~ /^\d+$/) {
+            # e.g. /0 or /1 => switch buffer by index
+            my $idx = $command; 
+            if ($idx >= 0 && $idx < @joined_channels) {
+                $current_channel_idx = $idx;
+                my $chan = $joined_channels[$current_channel_idx];
+                write_current_channel($chan);
+                print_to_tty("Switched to $chan\n");
+            } else {
+                print_to_tty("No such buffer index: $idx\n");
+            }
+            return;
+        }
+
+        # Otherwise dispatch via %COMMANDS
+        if (my $handler = $COMMANDS{$command}) {
+            $handler->(@args);
+        }
+        else {
+            print_to_tty("Unknown command: /$command\n");
+        }
+    }
+    else {
+        # Normal message, send to current channel
+        my $chan = read_current_channel();
+        send_raw("PRIVMSG $chan :$input");
+        display_local_message($nick, $chan, $input);
+    }
+}
+
+# Prompt is simply the current channel + "> "
+sub prompt_string {
+    my $chan = read_current_channel();
+    return "$chan> ";
+}
+
+# Tab completion reads files from $tmp_dir
+sub pirc_complete {
+    my ($text, $line, $start) = @_;
+    opendir my $dh, $tmp_dir or return ();
+    my @candidates;
+    while (my $f = readdir($dh)) {
+        next if $f eq '.' or $f eq '..' or $f eq '.c';
+        push @candidates, $f if index($f, $text) == 0;
+    }
+    closedir $dh;
+    return @candidates;
+}
+
+
+# --- Display / Formatting ----------------------------------------------------
+sub color_nick {
+    my ($nick_str) = @_;
+
+    state %COLOR_MAP = (
+        1 => 'bold red',
+        2 => 'bold green',
+        3 => 'bold yellow',
+        4 => 'bold blue',
+        5 => 'bold magenta',
+        6 => 'bold cyan',
+    );
+
+    my $col_idx    = (length($nick_str) % 6) + 1;
+    my $ansi_color = $COLOR_MAP{$col_idx} // 'bold white';
+    return colored($nick_str, $ansi_color);
+}
+
+sub display_irc_message {
+    my ($nick_in, $chan_in, $message_in) = @_;
+    my $colored_nick = color_nick($nick_in);
+
+    # Pad/truncate to width
+    my $nick_formatted = sprintf(
+        "%-${NICK_COLUMN_WIDTH}.${NICK_COLUMN_WIDTH}s",
+        $colored_nick
+    );
+
+    my @wrapped = fold_line($message_in, $LINE_WRAP_WIDTH);
+    for my $i (0 .. $#wrapped) {
+        if ($i == 0) {
+            print_to_tty("$nick_formatted $wrapped[$i]\n");
+        } else {
+            print_to_tty((' ' x $NICK_COLUMN_WIDTH) . " $wrapped[$i]\n");
+        }
+    }
+}
+
+sub display_local_message {
+    my ($nick_in, $chan_in, $message_in) = @_;
+    display_irc_message($nick_in, $chan_in, $message_in);
+}
+
+sub print_to_tty {
+    my ($text) = @_;
+    print STDOUT $text;
+}
+
+# --- Simple "fold" Implementation --------------------------------------------
+sub fold_line {
+    my ($text, $width) = @_;
+    my @out;
+
+    while (length($text) > $width) {
+        # Look at first $width chars
+        my $chunk   = substr($text, 0, $width);
+        my $cut_pos = rindex($chunk, ' ');
+
+        if ($cut_pos < 0) {
+            # No space in the chunk => break at width
+            push @out, $chunk;
+            $text = substr($text, $width);
+        } else {
+            # Break at last space
+            push @out, substr($text, 0, $cut_pos);
+            $text = substr($text, $cut_pos + 1);
+        }
+    }
+    push @out, $text if length($text) > 0;
+    return @out;
+}
