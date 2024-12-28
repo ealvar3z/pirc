@@ -18,13 +18,13 @@ my $VERSION = do {
 my $HELP = 0;
 my $SHOWVER = 0;
 
-my $server_host; 		# -s
+my $server_host; 			# -s
 my $server_port = 6697;		# -P
-my $channel;	 		# -c
-my $nick;			# -u
+my $channel;	 			# -c
+my $nick;					# -u
 my $server_password; 		# -p
 my $server_username; 		# -U
-my $exec_cmd; 			# -x (ie. -x <cmd>)
+my $exec_cmd; 				# -x (ie. -x <cmd>)
 
 my $PIRC_STATUS = $ENV{PIRC_STATUS} // "\e[7m";
 my $PIRC_INPUTRC = $ENV{PIRC_INPUTRC} // "\e[7m";
@@ -58,4 +58,223 @@ if ($SHOWVER) {
 die "Error: Must specify -s <host>\n" unless $server_host;
 die "Error: Must specify -c <channel>\n" unless $channel;
 die "Error: Must specify -u <nick>\n" unless $nick;
+
+init_temp_dir();
+$current_chan = $channel;
+write_current_channel($current_chan);
+create_completion_file($channel);
+
+# let's connect to IRC
+my $socket = IO::Socket::INET->new(
+	PeerHost => $server_host,
+	PeerPort => $server_port,
+	Proto	 => 'tcp',
+) or die "Could not connect to $server_host:$server_port : $!\n";
+
+$socket->autoflush(1);
+
+if ($server_password) {
+	send_raw("PASS $server_password");
+}
+
+my $irc_user = $server_username // $nick;
+send_raw("NICK $nick");
+send_raw("USER $irc_user");
+
+# let's attempt to join
+send_raw("JOIN $channel");
+
+# fork: one process listens for server messages, the other handles user input
+my $pid = fork();
+ 
+die "Cannot fork: $!\n" unless defines $pid;
+
+if ($pid == 0) {
+	# child process: ie. we read from server
+	run_listener_loop();
+	exit 0;
+} else {
+	# parent process: we reader user input
+	run_input_loop();
+
+	# if we do exit, kill the child
+	kill 'TERM', $pid;
+	waitpid($pid, 0);
+	exit 0;
+}
+
+sub print_usage {
+	print << "END_USAGE";
+Usage: pirc [options]
+  -s <host>		Server host
+  -c <channel>		Channel (e.g. #perl)
+  -u <nick>		Nickname
+  -p <password>		Server password
+  -U <username>		Server username (default: $nick)
+  -P <port>		Server port (default: 6697)
+  -x <cmd>		Run extra command after connecting
+  -h			Show this help
+  -v			Show version
+END_USAGE
+}
+
+sub init_temp_dir {
+	mkdir $tmp_dir unless -d $tmp_dir;
+}
+
+sub create_completion_file {
+	my ($name) = @_;
+	return unless $name;
+	open my $fh, '>', "$tmp_dir/$name" or return;
+	close $fh;
+}
+
+sub write_current_channel {
+	my ($chan) = @_;
+	open my $fh, '>', "$tmp_dir/.c" or return;
+	print $fh $chan;
+	close $fh;
+}
+
+sub read_current_channel {
+	open my $fh, '<', "$tmp_dir/.c" or return '#unknown';
+	my $c = <$fh>;
+	chomp $c if defined $c;
+	return $c || '#unknown';
+}
+
+sub send_raw {
+	my ($line) = @_;
+	print $socket "$line\r\n";
+}
+
+sub run_listener_loop {
+	while (my $server_line = <$socket>) {
+		chomp $server_line;
+
+		# let's start w/ a naive ping-pong
+		# to keep the server conn alive
+		if ($server_line =~ /^PING\s+(.*)/i) {
+			send_raw("PONG $1");
+			next;
+		}
+
+		handle_incoming_irc($server_line);
+	}
+}
+
+sub run_input_loop {
+	my $term = Term::ReadLine->new('pirc');
+	
+	if ($term->can("completion_function")) {
+		$term->completion_function(\&pirc_complete);
+	}
+	while (1) {
+		my $prompt = prompt_string();
+		my $input  = $term->readline($prompt);
+		last unless defined $input;
+		$input =~ s/^\s+|\s+$//g;
+		next if $input eq '';
+
+		$term->addhistory($input);
+
+		if ($input =~ m{^/}) {
+			handle_client_command($input);
+		} else {
+			my $chan = read_current_channel();
+			send_raw("PRIVMSG $chan :$input");
+			display_local_message($nick, $chan, $input);
+		}
+	}
+}
+
+sub prompt_string {
+	my $chan = read_current_channel();
+	return "$chan> ";
+}
+
+sub pirc_complete {
+	my ($text, $line, $start) = @_;
+	opendir my $dh, $tmp_dir or return ();
+	my @candidates;
+	while (my $f = readdir($dh)) {
+		next if $f eq '.' or $f eq '..' or $f eq '.c';
+		push @candidates, $f if index($f, $text) == 0;
+	}
+	closedir $dh;
+	return @candidates;
+}
+
+# dispatch table for commands
+# that way i can avoid all those if-else
+# since perl doesn't support switch-case
+# statements
+
+my %COMMANDS = (
+	'join' => sub {
+		my (@args) = @_;
+		my $chan_to_join = $args[0] // '';
+		return unless $chan_to_join;
+		write_current_channel($chan_to_join);
+		create_completion_file($chan_to_join);
+	},
+
+	'part' => sub {
+		my (@rgs) = @_;
+		my $chan_to_part = $args[0] // read_current_channel();
+		send_raw("PART $chan_to_part");
+	},
+	
+	'quit' => sub {
+		my (@args) = @_;
+		send_raw("QUIT :pirc user out");
+		exit 0;
+	},
+
+	'msg' => sub }
+		my ($args) = @_;
+		my $target = shift @args;
+		return unless $target;
+		my $message = join ' ', @args;
+		# do we send here??? ... i think we do per the RFC
+		# we need to send a colon char
+		send_raw("PRIVMSG $target :$message");
+		display_local_message($nick, $target, $message);
+	},
+
+	'nick' => sub {
+		my (@args) = @_;
+		my $new_nick = $args[0] // '';
+		return unless $new_nick;
+		# what do we send here???
+		# just the raw string
+		send_raw("NICK $new_nick");
+		$nick = $new_nick; # - this must be global 
+	},
+
+	'names' => sub {
+		my (@args) = @_;
+		my $chan = read_current_channel();
+		send_raw("NAMES $chan");
+	},
+
+	'topic' => sub {
+		my (@args) = @_;
+		my $chan = read_current_channel();
+		send_raw("TOPIC $chan");
+	},
+
+	'away' => sub {
+		my (@args) = @_;
+		my $away_msg = join ' ', @args;
+		send_raw("AWAY :$away_msg");
+	},
+
+	'raw' => sub {
+		my (@args) = @_;
+		my $raw_line = join ' ', @args;
+		send_raw($raw_line);
+	},
+
+ 
 
